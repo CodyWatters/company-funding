@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -95,6 +96,29 @@ SELTZ_SYSTEM_PROMPT = (
     + " Amounts are whole major-currency units, never millions or billions. "
     "Use null for any field you cannot verify. Do not infer."
 )
+
+# Riveter's arm is its enrichment product's row-level agent (POST
+# /v1/enrich_rows, prompt + output columns): one agent researches each company
+# and fills every output column in a single pass, metered by a per-row credit
+# budget (the API default — not tuned for this benchmark). The output columns
+# are the schema's own field names, and the schema rides inside the prompt
+# because the server side is what pins column formats — the same way the Seltz
+# arms carry the schema inside their system prompt. Single-row calls keep
+# per-case latency honest. Async by design: the POST returns a run id and
+# GET /runs/{id}/result long-polls up to 50s per call (the API maximum) until
+# terminal. The polling budget is wall-clock, not an attempt count: a run
+# queued behind other work answers its poll immediately instead of holding the
+# 50s, so counting attempts burns out in seconds while the run goes on to
+# finish (and bill). RIVETER_POLL_FLOOR_S spaces out those early returns.
+RIVETER_API_BASE = os.environ.get("RIVETER_API_BASE", "https://api.riveterhq.com")
+RIVETER_WAIT_SECONDS = 50
+RIVETER_TIMEOUT_S = 90
+# api.riveterhq.com's edge rejects urllib's default "Python-urllib/3.x" UA with
+# an opaque 403 before the API sees the request; identify the runner instead.
+RIVETER_USER_AGENT = "openbenchmarks-company-funding/1.0"
+RIVETER_OUTPUT_COLUMNS = tuple(OUTPUT_SCHEMA["properties"])
+RIVETER_POLL_DEADLINE_S = 1800
+RIVETER_POLL_FLOOR_S = 10
 
 
 def now() -> str:
@@ -438,6 +462,132 @@ def exa_agent(case: dict[str, str], effort: str = EXA_AGENT_EFFORT) -> tuple[dic
     }
 
 
+def riveter_prompt(case: dict[str, str]) -> str:
+    """The shared instruction plus the shared schema, verbatim, as one prompt."""
+    return (
+        instruction(case)
+        + " The output fields must exactly match this JSON Schema: "
+        + json.dumps(OUTPUT_SCHEMA)
+    )
+
+
+def riveter_cell_value(cells: Any) -> Any:
+    """First-row cell value of one output column, typed like the shared schema.
+
+    Cells hold strings (the column format is whatever the server pinned), so
+    numeric-looking values are lifted to numbers and the agent's "not found"
+    sentinel maps to null. Anything else stays verbatim.
+    """
+    if not isinstance(cells, list) or not cells or not isinstance(cells[0], dict):
+        return None
+    value = cells[0].get("value")
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    # "not found" is the agent's sentinel; a literal "null" is the schema's
+    # null coming back as text (cells are strings).
+    if not text or text.lower() in {"not found", "null"}:
+        return None
+    if re.fullmatch(r"-?\d+(\.\d+)?", text.replace(",", "")):
+        number = float(text.replace(",", ""))
+        return int(number) if number == int(number) else number
+    return text
+
+
+def riveter_request_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {os.environ['RIVETER_API_KEY']}",
+        "Content-Type": "application/json",
+        "User-Agent": RIVETER_USER_AGENT,
+    }
+
+
+def riveter_request_input(case: dict[str, str]) -> dict[str, list[str]]:
+    return {"Company Name": [case["company_name"]], "Company Domain": [case["company_domain"]]}
+
+
+def riveter_poll_run_to_terminal(body: dict[str, Any], headers: dict[str, str], label: str) -> dict[str, Any]:
+    """Long-poll GET /v1/runs/{id}/result until the run envelope is terminal.
+
+    The budget is wall-clock: a queued run answers its poll immediately rather
+    than holding the 50s long poll, so a sleep floor spaces out early returns
+    and the deadline — not an attempt count — decides when to give up.
+    """
+    run_id = body.get("id")
+    deadline = time.monotonic() + RIVETER_POLL_DEADLINE_S
+    while True:
+        status = body.get("status")
+        if status in {"stopped", "failed", "error"}:
+            error = body.get("error") or {}
+            raise ValueError(f"Riveter {label} run {status}: {error.get('message') or 'no error message'}")
+        if status == "success":
+            return body
+        if not run_id:
+            raise ValueError(f"Riveter {label} returned no run id (status {status!r})")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Riveter {label} run {run_id} still {status!r} after {RIVETER_POLL_DEADLINE_S}s of polling")
+        poll_started = time.monotonic()
+        body = request_json(
+            f"{RIVETER_API_BASE}/v1/runs/{run_id}/result?wait={RIVETER_WAIT_SECONDS}",
+            headers,
+            timeout=RIVETER_TIMEOUT_S,
+        )
+        poll_seconds = time.monotonic() - poll_started
+        if poll_seconds < RIVETER_POLL_FLOOR_S and body.get("status") not in {"success", "stopped", "failed", "error"}:
+            time.sleep(RIVETER_POLL_FLOOR_S - poll_seconds)
+
+
+def riveter_normalize_columnar_output(body: dict[str, Any], label: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Columnar {header: [cell, ...]} → the scored schema shape, by header slug.
+
+    Output columns beyond the schema go to the second dict (the raw envelope);
+    the scored shape stays identical to every other arm on the board.
+    """
+    output = body.get("output") or {}
+    if not isinstance(output, dict) or not output:
+        raise ValueError(f"Riveter {label} returned no columnar output")
+    normalized: dict[str, Any] = {}
+    unmapped: dict[str, Any] = {}
+    for header, cells in output.items():
+        slug = re.sub(r"[^a-z0-9]+", "_", str(header).lower()).strip("_")
+        if slug in {"company_name", "company_domain"}:
+            continue
+        value = riveter_cell_value(cells)
+        if slug in OUTPUT_SCHEMA["properties"]:
+            normalized[slug] = value
+        else:
+            unmapped[str(header)] = value
+    for field in OUTPUT_SCHEMA["properties"]:
+        normalized.setdefault(field, None)
+    return normalized, unmapped
+
+
+def riveter_enrich_rows(case: dict[str, str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Riveter row-level agent on one row: POST /v1/enrich_rows, prompt + output columns.
+
+    One agent researches the company and fills every output column in a single
+    pass, metered by a per-row credit budget left at the API default (not tuned
+    for this benchmark).
+    """
+    headers = riveter_request_headers()
+    payload = {
+        "prompt": riveter_prompt(case),
+        "output": list(RIVETER_OUTPUT_COLUMNS),
+        "input": riveter_request_input(case),
+    }
+    body = request_json(f"{RIVETER_API_BASE}/v1/enrich_rows", headers, payload, timeout=RIVETER_TIMEOUT_S)
+    body = riveter_poll_run_to_terminal(body, headers, "enrich_rows")
+    normalized, unmapped = riveter_normalize_columnar_output(body, "enrich_rows")
+    # Credits, run id and unexpected columns stay on the envelope; the scored
+    # schema has to stay identical across every provider on the board.
+    return normalized, {
+        "response": body,
+        "run_id": body.get("id"),
+        "credits_used": body.get("credits_used"),
+        "unmapped_output_columns": unmapped or None,
+    }
+
+
 PROVIDERS = {
     "exa": exa,
     "exa-instant": partial(exa, search_type="instant"),
@@ -446,6 +596,7 @@ PROVIDERS = {
     "parallel-responses-medium": parallel_responses,
     "firecrawl": firecrawl,
     "firecrawl-spark-2": partial(firecrawl, model=FIRECRAWL_SPARK_2_MODEL),
+    "riveter-enrich-rows": riveter_enrich_rows,
     "seltz-companies": partial(seltz, scope="companies"),
     "seltz-news": partial(seltz, scope="news"),
 }
@@ -454,13 +605,15 @@ REQUIRED_ENV = {
     "parallel": "PARALLEL_API_KEY",
     "parallel-responses-medium": "PARALLEL_API_KEY",
     "firecrawl": "FIRECRAWL_API_KEY", "firecrawl-spark-2": "FIRECRAWL_API_KEY",
+    "riveter-enrich-rows": "RIVETER_API_KEY",
     "seltz-companies": "SELTZ_API_KEY", "seltz-news": "SELTZ_API_KEY",
 }
 DEFAULT_CONCURRENCY = {
     "exa": 12, "exa-instant": 12, "parallel": 8, "parallel-responses-medium": 8,
     # Agentic search runs are long and metered; keep these low until a smoke
-    # test shows what each vendor tolerates.
-    "exa-agent": 4, "firecrawl": 4, "firecrawl-spark-2": 4,
+    # test shows what each vendor tolerates. riveter-enrich-rows runs one
+    # metered agent per row, so it starts at the lowest concurrency on the board.
+    "exa-agent": 4, "firecrawl": 4, "firecrawl-spark-2": 4, "riveter-enrich-rows": 2,
     "seltz-companies": 6, "seltz-news": 6,
 }
 

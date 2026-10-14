@@ -40,7 +40,7 @@ The other four fields contribute to the separate returned-data coverage metric; 
 | `data/funding/pricing-v1.json` | Dated public entry-tier cost assumptions used for the estimated USD cost display |
 | `scripts/funding/run_funding_benchmark.py` | Credit-safe, resumable provider runner |
 | `scripts/funding/smoke_test_funding_providers.py` | Small contract smoke test for the original endpoint adapters |
-| `scripts/funding/run_structured_web_research.py` | Resumable runner for every natural-language arm: Exa search, Exa Agent, Parallel Task and Responses, Seltz, Firecrawl; raw outputs remain local |
+| `scripts/funding/run_structured_web_research.py` | Resumable runner for every natural-language arm: Exa search, Exa Agent, Parallel Task and Responses, Seltz, Firecrawl, Riveter Enrich Rows; raw outputs remain local |
 | `scripts/funding/run_crustdata_funding_batch.py` | Credit-safe submit/poll runner for Crustdata's 300-company batch enrichment |
 | `scripts/funding/run_zoominfo_funding.py` | Credit-safe, resumable ZoomInfo GTM CLI runner; serial 10-domain requests with a two-second interval |
 | `scripts/funding/score_funding_stage_dry_run.py` | Transparent latest-stage taxonomy and offline scoring report |
@@ -86,8 +86,9 @@ PYTHONPATH=scripts .venv/bin/python scripts/funding/run_structured_web_research.
 question in natural language: `exa` and `exa-instant` (Search API at two search
 types), `exa-agent` (Agent API), `parallel` (Task API) and
 `parallel-responses-medium` (Responses API), `seltz-companies` and `seltz-news`
-(Answer API at two search scopes), and `firecrawl` and `firecrawl-spark-2`
-(Agent API with Spark 1 Mini and Spark 2 respectively). All of them send the
+(Answer API at two search scopes), `firecrawl` and `firecrawl-spark-2`
+(Agent API with Spark 1 Mini and Spark 2 respectively), and
+`riveter-enrich-rows` (Enrich Rows API). All of them send the
 same instruction and the same output schema, so the endpoint or its one varied
 parameter is the only difference between arms; the contract tests beside the
 runner assert that.
@@ -102,6 +103,12 @@ explicit cap and records the `creditsUsed` each run reports, which is where its
 published cost comes from. The `firecrawl` slug remains pinned to
 `spark-1-mini`; `firecrawl-spark-2` is a separate arm pinned to `spark-2`, so a
 rerun cannot silently change the model behind an existing leaderboard row.
+
+Riveter's Enrich Rows API dispatches one row-level agent per company that
+fills every output column in a single research pass, metered by a per-row
+credit budget. The runner leaves that budget at the API default rather than
+tuning it, and records each run's reported `credits_used`, which is where its
+published cost comes from.
 
 Use `run_crustdata_funding_batch.py submit` then
 `poll` for Crustdata. Crunchbase is deliberately not rerun by a script: it
